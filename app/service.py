@@ -34,6 +34,14 @@
 - 键集分页游标 after/next_after 为不透明字符串，编码上一页末行的
   (occurred_at, event_id) 复合位置；空页回显入参 after，游标保持不变。
 
+事件审计时间桶统计（event_metrics，纯读）：
+- 在调用方提供的同一只读快照内读取 [start_ts, end_ts) 左闭右开窗口内
+  指定 source 的事件，按 occurred_at 划入等宽时间桶（左闭右开，桶边界
+  对齐 start_ts），返回每桶各 canonical severity 计数、事件总数及涉及的
+  不同 segment_id 数；无事件桶同样输出（计数为 0），末桶可短于桶宽；
+- 非法时间范围（end <= start）、非正/非有限桶长或桶数超过上限抛
+  ValueError（调用方回 422）；仅执行 SELECT，不改写任何表。
+
 变更水位历史快照（get_segment_snapshot，纯读）：
 - 在调用方提供的同一只读事务内，以 segment_changes 为唯一事实来源重建
   指定变更水位（at_change_id）时刻的段状态：每个 segment_id 取不晚于水位的
@@ -59,7 +67,7 @@ import json
 import math
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from . import severity as sev
 
@@ -192,6 +200,100 @@ def list_events(
         else after
     )
     return {"events": events, "next_after": next_after}
+
+
+# 时间桶统计的防御上限：避免极大窗口/极小桶长导致输出无界桶位
+MAX_METRIC_BUCKETS = 10_000
+
+
+def event_metrics(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    start_ts: float,
+    end_ts: float,
+    bucket_seconds: float,
+) -> dict:
+    """事件审计时间桶统计（纯读）：等宽左闭右开桶内的级别计数/总数/不同段数。
+
+    - 查询窗口为 [start_ts, end_ts)（左闭右开，epoch 秒），仅统计该 source；
+    - 桶从 start_ts 起按 bucket_seconds 等宽划分，末桶可短于桶宽；
+      无事件桶同样输出，severity_counts 固定包含五个 canonical 级别键；
+    - distinct_segment_count 按查询快照中事件的当前 segment_id 实时归属统计；
+    - end_ts <= start_ts、bucket_seconds 非正/非有限或桶数超过
+      MAX_METRIC_BUCKETS 时抛 ValueError（调用方回 422）。
+
+    桶序号一律以整数微秒（occurred_at 的存储精度）相对 start_ts 的跨度计算，
+    避免大 epoch 基值上浮点除法把恰好落在桶边界的事件划入前一桶。
+
+    调用方应使用 read_only_session：本函数只执行 SELECT，在同一快照内完成统计。
+    """
+    if not math.isfinite(start_ts) or not math.isfinite(end_ts):
+        raise ValueError("非法时间范围")
+    if end_ts <= start_ts:
+        raise ValueError("时间范围为空：end_at 必须晚于 start_at")
+    if not isinstance(bucket_seconds, (int, float)) or isinstance(
+        bucket_seconds, bool
+    ) or not math.isfinite(bucket_seconds) or bucket_seconds <= 0:
+        raise ValueError("bucket_seconds 必须为正数")
+
+    # 用整数微秒跨度算桶数与桶位，避免浮点除法 ceil 在整倍数边界多算一个桶
+    start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+    end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+    span_us = (end_dt - start_dt) // timedelta(microseconds=1)
+    width_us = int(round(bucket_seconds * 1_000_000))
+    if width_us <= 0:
+        raise ValueError("bucket_seconds 过小（最小粒度为 1 微秒）")
+    bucket_count = (span_us + width_us - 1) // width_us
+    if bucket_count > MAX_METRIC_BUCKETS:
+        raise ValueError(
+            f"桶数超过上限：时间范围/桶长最多生成 {MAX_METRIC_BUCKETS} 个桶"
+        )
+
+    def _bucket_index_for(ts: float) -> int:
+        delta_us = (
+            datetime.fromtimestamp(ts, tz=timezone.utc) - start_dt
+        ) // timedelta(microseconds=1)
+        return max(delta_us // width_us, 0)
+
+    buckets: list[dict] = [
+        {
+            "bucket_start": _iso(start_ts + i * bucket_seconds),
+            "bucket_end": _iso(min(start_ts + (i + 1) * bucket_seconds, end_ts)),
+            "severity_counts": {level: 0 for level in sev.LEVELS},
+            "event_count": 0,
+            "distinct_segment_count": 0,
+        }
+        for i in range(bucket_count)
+    ]
+    segment_sets: list[set[int]] = [set() for _ in range(bucket_count)]
+
+    rows = conn.execute(
+        """
+        SELECT occurred_at, severity, segment_id
+        FROM events
+        WHERE source = ? AND occurred_at >= ? AND occurred_at < ?
+        ORDER BY occurred_at, event_id
+        """,
+        (source, start_ts, end_ts),
+    ).fetchall()
+    for row in rows:
+        index = _bucket_index_for(row["occurred_at"])
+        bucket = buckets[index]
+        bucket["severity_counts"][row["severity"]] += 1
+        bucket["event_count"] += 1
+        segment_sets[index].add(row["segment_id"])
+
+    for bucket, segment_ids in zip(buckets, segment_sets):
+        bucket["distinct_segment_count"] = len(segment_ids)
+
+    return {
+        "source": source,
+        "start_at": _iso(start_ts),
+        "end_at": _iso(end_ts),
+        "bucket_seconds": float(bucket_seconds),
+        "buckets": buckets,
+    }
 
 
 def _record_change(

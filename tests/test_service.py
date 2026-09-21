@@ -997,6 +997,220 @@ class ServiceTestCase(unittest.TestCase):
         self.assertEqual(p1, p2)
         self.assertEqual(len(p2["events"]), 1)
 
+    # ---- 事件审计时间桶统计（event_metrics，纯读）----
+
+    def metrics(self, source, start_ts, end_ts, bucket_seconds):
+        with read_only_session(self.db_path) as conn:
+            return service.event_metrics(
+                conn,
+                source=source,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                bucket_seconds=bucket_seconds,
+            )
+
+    def test_metrics_buckets_counts_and_empty_buckets(self):
+        # SILENCE=10：e1@0、e2@5 同段 A；e3@20、e4@25 同段 B；中间桶无事件
+        self.submit("s1", "e1", 0.0, "info")
+        self.submit("s1", "e2", 5.0, "error")
+        self.submit("s1", "e3", 20.0, "warning")
+        self.submit("s1", "e4", 25.0, "critical")
+
+        r = self.metrics("s1", 0.0, 40.0, 10.0)
+        self.assertEqual(r["source"], "s1")
+        self.assertEqual(r["start_at"], "1970-01-01T00:00:00+00:00")
+        self.assertEqual(r["end_at"], "1970-01-01T00:00:40+00:00")
+        self.assertEqual(r["bucket_seconds"], 10.0)
+
+        buckets = r["buckets"]
+        self.assertEqual(len(buckets), 4)  # 含无事件桶
+        self.assertEqual(
+            [(b["bucket_start"], b["bucket_end"]) for b in buckets],
+            [
+                ("1970-01-01T00:00:00+00:00", "1970-01-01T00:00:10+00:00"),
+                ("1970-01-01T00:00:10+00:00", "1970-01-01T00:00:20+00:00"),
+                ("1970-01-01T00:00:20+00:00", "1970-01-01T00:00:30+00:00"),
+                ("1970-01-01T00:00:30+00:00", "1970-01-01T00:00:40+00:00"),
+            ],
+        )
+        # 桶按时间升序（左闭右开边界单调）
+        starts = [b["bucket_start"] for b in buckets]
+        self.assertEqual(starts, sorted(starts))
+
+        zero_counts = {level: 0 for level in (
+            "debug", "info", "warning", "error", "critical"
+        )}
+        for bucket in buckets:
+            self.assertEqual(
+                set(bucket["severity_counts"]),
+                {"debug", "info", "warning", "error", "critical"},
+            )
+
+        b0, b1, b2, b3 = buckets
+        self.assertEqual(b0["severity_counts"], {**zero_counts, "info": 1, "error": 1})
+        self.assertEqual(b0["event_count"], 2)
+        self.assertEqual(b0["distinct_segment_count"], 1)  # 两事件同段 A
+        self.assertEqual(b1["severity_counts"], zero_counts)
+        self.assertEqual(b1["event_count"], 0)
+        self.assertEqual(b1["distinct_segment_count"], 0)
+        self.assertEqual(
+            b2["severity_counts"], {**zero_counts, "warning": 1, "critical": 1}
+        )
+        self.assertEqual(b2["event_count"], 2)
+        self.assertEqual(b2["distinct_segment_count"], 1)  # 两事件同段 B
+        self.assertEqual(b3["severity_counts"], zero_counts)
+        self.assertEqual(b3["event_count"], 0)
+
+    def test_metrics_window_is_half_open(self):
+        # 恰好落在桶边界/窗口边界的事件：左闭右开
+        self.submit("s1", "a", 10.0, "info")
+        self.submit("s1", "b", 20.0, "error")
+
+        # 窗口 [0, 20)：a@10 在内（第二个桶），b@20 被排除
+        r = self.metrics("s1", 0.0, 20.0, 10.0)
+        self.assertEqual(len(r["buckets"]), 2)
+        self.assertEqual(r["buckets"][0]["event_count"], 0)
+        self.assertEqual(r["buckets"][1]["event_count"], 1)
+        self.assertEqual(r["buckets"][1]["severity_counts"]["info"], 1)
+
+        # 窗口 [20, 30)：b@20 在起点被包含
+        r = self.metrics("s1", 20.0, 30.0, 10.0)
+        self.assertEqual(len(r["buckets"]), 1)
+        self.assertEqual(r["buckets"][0]["event_count"], 1)
+        self.assertEqual(r["buckets"][0]["severity_counts"]["error"], 1)
+
+    def test_metrics_last_bucket_may_be_shorter(self):
+        self.submit("s1", "e1", 24.0)
+        r = self.metrics("s1", 0.0, 25.0, 10.0)  # 25/10 向上取整 → 3 桶
+        self.assertEqual(len(r["buckets"]), 3)
+        last = r["buckets"][-1]
+        self.assertEqual(last["bucket_start"], "1970-01-01T00:00:20+00:00")
+        self.assertEqual(last["bucket_end"], "1970-01-01T00:00:25+00:00")  # 截到 end
+        self.assertEqual(last["event_count"], 1)
+
+    def test_metrics_distinct_segment_ids_per_bucket(self):
+        # 同段事件落在两个桶：每桶 distinct=1；不同段落同一桶：distinct=2
+        a = self.submit("s1", "e1", 0.0)["segment"]["id"]
+        self.submit("s1", "e2", 5.0)   # 与 e1 同段 A
+        b = self.submit("s1", "e3", 20.0)["segment"]["id"]  # 间隔 15 > 10 → 段 B
+
+        r = self.metrics("s1", 0.0, 40.0, 20.0)
+        self.assertEqual(len(r["buckets"]), 2)
+        self.assertEqual(r["buckets"][0]["event_count"], 2)
+        self.assertEqual(r["buckets"][0]["distinct_segment_count"], 1)
+        self.assertEqual(r["buckets"][1]["event_count"], 1)
+        self.assertEqual(r["buckets"][1]["distinct_segment_count"], 1)
+
+        r = self.metrics("s1", 0.0, 40.0, 40.0)  # 单桶含两个不同段
+        self.assertEqual(len(r["buckets"]), 1)
+        self.assertEqual(r["buckets"][0]["event_count"], 3)
+        self.assertEqual(r["buckets"][0]["distinct_segment_count"], 2)
+        self.assertNotEqual(a, b)
+
+    def test_metrics_distinct_segments_track_current_ownership_after_withdraw(self):
+        # 桥接合并后所有事件同段；撤回桥接事件拆段，统计反映实时归属
+        self.submit("s1", "e1", 0.0)
+        self.submit("s1", "e2", 20.0)
+        self.submit("s1", "e3", 10.0, "critical")  # 桥接 → 全并入段 A
+        r = self.metrics("s1", 0.0, 30.0, 10.0)
+        self.assertEqual([b["distinct_segment_count"] for b in r["buckets"]], [1, 1, 1])
+
+        self.withdraw("s1", "e3")  # 拆段：e2 归新段
+        r = self.metrics("s1", 0.0, 30.0, 10.0)
+        counts = [b["event_count"] for b in r["buckets"]]
+        distinct = [b["distinct_segment_count"] for b in r["buckets"]]
+        self.assertEqual(counts, [1, 0, 1])
+        self.assertEqual(distinct, [1, 0, 1])
+        # 有数据的两个桶时间位置不同（首桶与第三桶）
+        self.assertNotEqual(
+            r["buckets"][0]["bucket_start"], r["buckets"][2]["bucket_start"]
+        )
+        self.assertEqual(r["buckets"][1]["event_count"], 0)  # 中间桶无事件
+
+    def test_metrics_filters_by_source(self):
+        self.submit("s1", "e1", 0.0, "error")
+        self.submit("s2", "e2", 0.0, "critical")
+        r = self.metrics("s1", 0.0, 10.0, 10.0)
+        self.assertEqual(r["buckets"][0]["event_count"], 1)
+        self.assertEqual(r["buckets"][0]["severity_counts"]["error"], 1)
+        self.assertEqual(r["buckets"][0]["severity_counts"]["critical"], 0)
+
+    def test_metrics_unknown_source_all_zero_buckets(self):
+        r = self.metrics("ghost", 0.0, 30.0, 10.0)
+        self.assertEqual(len(r["buckets"]), 3)
+        for bucket in r["buckets"]:
+            self.assertEqual(bucket["event_count"], 0)
+            self.assertEqual(bucket["distinct_segment_count"], 0)
+            self.assertTrue(all(v == 0 for v in bucket["severity_counts"].values()))
+
+    def test_metrics_same_timestamp_events_same_bucket(self):
+        for eid, level in [("a", "info"), ("b", "error"), ("c", "critical")]:
+            self.submit("s1", eid, 0.0, level)
+        r = self.metrics("s1", 0.0, 10.0, 10.0)
+        self.assertEqual(len(r["buckets"]), 1)
+        self.assertEqual(r["buckets"][0]["event_count"], 3)
+        self.assertEqual(
+            r["buckets"][0]["severity_counts"],
+            {"debug": 0, "info": 1, "warning": 0, "error": 1, "critical": 1},
+        )
+
+    def test_metrics_float_width_boundary_aligned_correctly(self):
+        # 0.3/0.1 的浮点结果约为 2.9999999999999996：必须归入第 4 个桶（index 3）
+        self.submit("s1", "e1", 0.3)
+        r = self.metrics("s1", 0.0, 0.5, 0.1)
+        self.assertEqual(len(r["buckets"]), 5)
+        counts = [b["event_count"] for b in r["buckets"]]
+        self.assertEqual(counts, [0, 0, 0, 1, 0])
+        self.assertEqual(
+            r["buckets"][3]["bucket_start"], "1970-01-01T00:00:00.300000+00:00"
+        )
+
+    def test_metrics_float_exact_multiple_does_not_add_bucket(self):
+        # 窗口恰好是桶宽整倍数时桶数不 +1（0.3 == 3 * 0.1）
+        r = self.metrics("s1", 0.0, 0.3, 0.1)
+        self.assertEqual(len(r["buckets"]), 3)
+        self.assertEqual(
+            r["buckets"][-1]["bucket_end"], "1970-01-01T00:00:00.300000+00:00"
+        )
+
+    def test_metrics_rejects_invalid_range_and_width(self):
+        with self.assertRaises(ValueError):
+            self.metrics("s1", 10.0, 10.0, 10.0)  # end == start：空窗口
+        with self.assertRaises(ValueError):
+            self.metrics("s1", 20.0, 10.0, 10.0)  # end < start
+        with self.assertRaises(ValueError):
+            self.metrics("s1", 0.0, 10.0, 0.0)   # 桶长为 0
+        with self.assertRaises(ValueError):
+            self.metrics("s1", 0.0, 10.0, -1.0)  # 负桶长
+        with self.assertRaises(ValueError):
+            self.metrics("s1", 0.0, 10.0, float("nan"))
+        with self.assertRaises(ValueError):
+            self.metrics("s1", 0.0, 10.0, float("inf"))
+
+    def test_metrics_bucket_count_capped(self):
+        # 10000 个桶允许，10001 个拒绝
+        r = self.metrics("s1", 0.0, 10_000.0, 1.0)
+        self.assertEqual(len(r["buckets"]), service.MAX_METRIC_BUCKETS)
+        with self.assertRaises(ValueError):
+            self.metrics("s1", 0.0, 10_001.0, 1.0)
+
+    def test_metrics_reads_consistent_snapshot(self):
+        self.submit("s1", "e1", 0.0)
+        with read_only_session(self.db_path) as conn:
+            kwargs = dict(source="s1", start_ts=0.0, end_ts=20.0, bucket_seconds=10.0)
+            p1 = service.event_metrics(conn, **kwargs)
+            self.submit("s1", "e2", 5.0)  # 快照开启后写入
+            p2 = service.event_metrics(conn, **kwargs)
+        self.assertEqual(p1, p2)
+        self.assertEqual(sum(b["event_count"] for b in p2["buckets"]), 1)
+
+    def test_metrics_does_not_mutate_data(self):
+        self.submit("s1", "e1", 0.0)
+        self.submit("s1", "e2", 20.0)
+        before = self.changes()
+        self.metrics("s1", 0.0, 40.0, 10.0)
+        self.assertEqual(self.changes(), before)
+
     # ---- 人工确认审计（acknowledge_segment / list_acknowledgements）----
 
     def ack(self, segment_id, *, operator="ops", note="n",

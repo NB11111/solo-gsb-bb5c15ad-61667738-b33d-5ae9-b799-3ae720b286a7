@@ -10,6 +10,9 @@ _LEVELS = {
     "critical": 50,
 }
 
+# canonical 级别名称（按权重升序）：统计响应的固定字段次序
+LEVELS = ("debug", "info", "warning", "error", "critical")
+
 # 常见别名归一化
 _ALIASES = {
     "warn": "warning",

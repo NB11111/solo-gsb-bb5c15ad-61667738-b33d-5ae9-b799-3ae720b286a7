@@ -14,6 +14,7 @@ from .schemas import (
     AcknowledgementIn,
     AcknowledgementOut,
     EventIn,
+    EventMetricsResponse,
     EventsPage,
     IngestResponse,
     ResegmentationPreviewResponse,
@@ -37,7 +38,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="设备告警事件段聚合服务",
-        version="1.4.0",
+        version="1.5.0",
         lifespan=lifespan,
     )
 
@@ -94,6 +95,40 @@ def create_app(settings: Settings) -> FastAPI:
                     limit=limit,
                 )
         except ValueError as exc:  # 游标解码失败等输入错误 → 422
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/events/metrics", response_model=EventMetricsResponse)
+    def event_metrics(
+        source: str = Query(min_length=1, max_length=256),
+        start_at: datetime = Query(...),
+        end_at: datetime = Query(...),
+        bucket_seconds: float = Query(..., gt=0),
+    ) -> dict:
+        """事件审计时间桶统计：在**单一只读快照**内按 occurred_at 聚合。
+
+        - ``source`` 必填；时间窗口为 ``[start_at, end_at)`` **左闭右开**
+          （ISO 8601，无时区按 UTC 处理，``end_at`` 不包含），桶从
+          ``start_at`` 起按 ``bucket_seconds`` 等宽划分（边界统一按 UTC）；
+        - 每桶返回五个 canonical severity 各自计数、事件总数与桶内事件
+          **当前**涉及的不同 segment_id 数；无事件桶同样输出，末桶可短于桶宽；
+        - 桶按时间**升序**输出；接口纯读（query_only 连接），不改写任何表；
+        - ``start_at`` 不晚于 ``end_at``、时间窗口非空、桶数不超过
+          10000，否则返回 422。
+        """
+        if start_at.tzinfo is None:
+            start_at = start_at.replace(tzinfo=timezone.utc)
+        if end_at.tzinfo is None:
+            end_at = end_at.replace(tzinfo=timezone.utc)
+        try:
+            with read_only_session(settings.database_path) as conn:
+                return service.event_metrics(
+                    conn,
+                    source=source,
+                    start_ts=start_at.timestamp(),
+                    end_ts=end_at.timestamp(),
+                    bucket_seconds=bucket_seconds,
+                )
+        except ValueError as exc:  # 空时间范围/桶数超限等输入错误 → 422
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/events", response_model=IngestResponse)

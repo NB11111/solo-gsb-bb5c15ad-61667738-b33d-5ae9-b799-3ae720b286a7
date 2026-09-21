@@ -655,6 +655,316 @@ def test_get_events_is_read_only(client):
     assert client.get("/segment-changes").json() == changes
 
 
+# ---- 事件审计时间桶统计 GET /events/metrics ----
+
+def _metrics(client, **params):
+    return client.get("/events/metrics", params=params)
+
+
+def test_metrics_bucketing_counts_and_empty_buckets(client):
+    # silence=60：e1@08:00:00、e2@08:00:30 同段；e3@08:02:00、e4@08:02:30 另一段
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "info")
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z", "error")
+    _post(client, "gw-01", "e3", "2026-09-20T08:02:00Z", "warning")
+    _post(client, "gw-01", "e4", "2026-09-20T08:02:30Z", "critical")
+    _post(client, "gw-02", "x", "2026-09-20T08:00:00Z", "critical")  # 其他 source
+
+    resp = _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20T08:00:00Z",
+        end_at="2026-09-20T08:04:00Z",
+        bucket_seconds=60,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "gw-01"
+    assert body["bucket_seconds"] == 60.0
+    assert body["start_at"].replace("Z", "+00:00") == "2026-09-20T08:00:00+00:00"
+    assert body["end_at"].replace("Z", "+00:00") == "2026-09-20T08:04:00+00:00"
+
+    buckets = body["buckets"]
+    assert len(buckets) == 4  # 含无事件桶，按时间升序
+    assert [b["bucket_start"] for b in buckets] == sorted(
+        b["bucket_start"] for b in buckets
+    )
+    assert (buckets[0]["bucket_start"].replace("Z", "+00:00")
+            == "2026-09-20T08:00:00+00:00")
+    assert (buckets[0]["bucket_end"].replace("Z", "+00:00")
+            == "2026-09-20T08:01:00+00:00")
+
+    zero = {"debug": 0, "info": 0, "warning": 0, "error": 0, "critical": 0}
+    for bucket in buckets:
+        assert set(bucket) == {
+            "bucket_start", "bucket_end", "severity_counts",
+            "event_count", "distinct_segment_count",
+        }
+        assert set(bucket["severity_counts"]) == set(zero)
+
+    assert buckets[0]["severity_counts"] == {**zero, "info": 1, "error": 1}
+    assert buckets[0]["event_count"] == 2
+    assert buckets[0]["distinct_segment_count"] == 1  # e1/e2 同段
+    assert buckets[1]["severity_counts"] == zero
+    assert buckets[1]["event_count"] == 0
+    assert buckets[1]["distinct_segment_count"] == 0
+    assert buckets[2]["severity_counts"] == {**zero, "warning": 1, "critical": 1}
+    assert buckets[2]["event_count"] == 2
+    assert buckets[2]["distinct_segment_count"] == 1
+    assert buckets[3]["severity_counts"] == zero
+
+
+def test_metrics_half_open_boundary_excludes_end_at(client):
+    # 桶边界与窗口边界上的事件：左闭右开
+    _post(client, "gw-01", "a", "2026-09-20T08:00:00Z", "info")
+    _post(client, "gw-01", "b", "2026-09-20T08:01:00Z", "error")
+    _post(client, "gw-01", "c", "2026-09-20T08:02:00Z", "critical")
+
+    # [08:00, 08:02)：包含 08:00、08:01，排除 08:02
+    body = _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20T08:00:00Z",
+        end_at="2026-09-20T08:02:00Z",
+        bucket_seconds=60,
+    ).json()
+    assert [b["event_count"] for b in body["buckets"]] == [1, 1]
+    assert body["buckets"][0]["severity_counts"]["info"] == 1
+    assert body["buckets"][1]["severity_counts"]["error"] == 1
+
+    # 恰好等于桶边界的事件落在下一个桶（@08:01 属第二桶，不属第一桶）
+    body = _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20T08:01:00Z",
+        end_at="2026-09-20T08:03:00Z",
+        bucket_seconds=60,
+    ).json()
+    assert [b["event_count"] for b in body["buckets"]] == [1, 1]
+    assert body["buckets"][0]["severity_counts"]["error"] == 1
+    assert body["buckets"][1]["severity_counts"]["critical"] == 1
+
+
+def test_metrics_last_bucket_clamped_to_end_at(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:02:30Z")
+    body = _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20T08:00:00Z",
+        end_at="2026-09-20T08:02:30Z",
+        bucket_seconds=60,
+    ).json()
+    assert len(body["buckets"]) == 3
+    last = body["buckets"][-1]
+    assert last["bucket_start"].replace("Z", "+00:00") == "2026-09-20T08:02:00+00:00"
+    assert last["bucket_end"].replace("Z", "+00:00") == "2026-09-20T08:02:30+00:00"
+    assert last["event_count"] == 0  # e1@08:02:30 恰好等于 end，被排除
+
+
+def test_metrics_distinct_segment_ids_tracks_current_ownership(client):
+    a = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    _post(client, "gw-01", "e2", "2026-09-20T08:02:00Z")
+    _post(client, "gw-01", "e3", "2026-09-20T08:01:00Z", "critical")  # 桥接合并
+
+    def counts():
+        body = _metrics(
+            client,
+            source="gw-01",
+            start_at="2026-09-20T08:00:00Z",
+            end_at="2026-09-20T08:03:00Z",
+            bucket_seconds=60,
+        ).json()
+        return [(b["event_count"], b["distinct_segment_count"]) for b in body["buckets"]]
+
+    assert counts() == [(1, 1), (1, 1), (1, 1)]  # 全部并入段 A
+    client.delete("/events/gw-01/e3")           # 拆段
+    assert counts() == [(1, 1), (0, 0), (1, 1)]  # 反映重算后的实时归属
+
+
+def test_metrics_single_bucket_counts_distinct_segments(client):
+    a = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    b = _post(client, "gw-01", "e2", "2026-09-20T08:02:00Z", "error")["segment"]
+    body = _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20T08:00:00Z",
+        end_at="2026-09-20T08:05:00Z",
+        bucket_seconds=300,
+    ).json()
+    assert len(body["buckets"]) == 1
+    bucket = body["buckets"][0]
+    assert bucket["event_count"] == 2
+    assert bucket["distinct_segment_count"] == 2
+    assert bucket["severity_counts"]["info"] == 1
+    assert bucket["severity_counts"]["error"] == 1
+    assert a["id"] != b["id"]
+
+
+def test_metrics_source_isolation(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")
+    _post(client, "gw-02", "e2", "2026-09-20T08:00:00Z", "critical")
+    body = _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20T08:00:00Z",
+        end_at="2026-09-20T08:01:00Z",
+        bucket_seconds=60,
+    ).json()
+    assert body["buckets"][0]["event_count"] == 1
+    assert body["buckets"][0]["severity_counts"]["info"] == 1
+    assert body["buckets"][0]["severity_counts"]["critical"] == 0
+
+    # 未知 source：仍覆盖整个范围输出零计数桶
+    body = _metrics(
+        client,
+        source="ghost",
+        start_at="2026-09-20T08:00:00Z",
+        end_at="2026-09-20T08:02:00Z",
+        bucket_seconds=60,
+    ).json()
+    assert len(body["buckets"]) == 2
+    assert all(b["event_count"] == 0 for b in body["buckets"])
+    assert all(b["distinct_segment_count"] == 0 for b in body["buckets"])
+
+
+def test_metrics_naive_datetime_treated_as_utc(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "warning")
+    body = _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20 08:00:00",
+        end_at="2026-09-20 08:01:00",
+        bucket_seconds=60,
+    ).json()
+    assert body["buckets"][0]["event_count"] == 1
+    assert body["buckets"][0]["severity_counts"]["warning"] == 1
+
+
+def test_metrics_timezone_offsets_normalized_to_utc_boundaries(client):
+    # +08:00 的 16:00 等于 UTC 08:00；start/end 混合带时区写法
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:30Z", "error")
+    body = _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20T16:00:00+08:00",
+        end_at="2026-09-20T08:01:00+00:00",
+        bucket_seconds=60,
+    ).json()
+    assert len(body["buckets"]) == 1
+    assert body["start_at"].replace("Z", "+00:00") == "2026-09-20T08:00:00+00:00"
+    assert body["buckets"][0]["event_count"] == 1
+    assert body["buckets"][0]["severity_counts"]["error"] == 1
+
+
+def test_metrics_float_boundary_aligned(client):
+    # 桶长 0.1s：事件落在 0.3s 边界上必须进入 [0.3, 0.4) 桶
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00.300Z")
+    body = _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20T08:00:00Z",
+        end_at="2026-09-20T08:00:00.500Z",
+        bucket_seconds=0.1,
+    ).json()
+    assert len(body["buckets"]) == 5
+    assert [b["event_count"] for b in body["buckets"]] == [0, 0, 0, 1, 0]
+    assert (body["buckets"][3]["bucket_start"].replace("Z", "+00:00")
+            == "2026-09-20T08:00:00.300000+00:00")
+
+
+def test_metrics_param_validation(client):
+    base = {
+        "source": "gw-01",
+        "start_at": "2026-09-20T08:00:00Z",
+        "end_at": "2026-09-20T09:00:00Z",
+        "bucket_seconds": 60,
+    }
+    # 缺必填参数
+    for missing in ("source", "start_at", "end_at", "bucket_seconds"):
+        params = {k: v for k, v in base.items() if k != missing}
+        assert _metrics(client, **params).status_code == 422
+    # 空 source
+    assert _metrics(client, **{**base, "source": ""}).status_code == 422
+    # 桶长为 0 / 负数 / 非数字
+    assert _metrics(client, **{**base, "bucket_seconds": 0}).status_code == 422
+    assert _metrics(client, **{**base, "bucket_seconds": -10}).status_code == 422
+    assert _metrics(client, **{**base, "bucket_seconds": "soon"}).status_code == 422
+    # start_at 晚于 end_at
+    assert _metrics(
+        client,
+        **{**base,
+           "start_at": "2026-09-20T09:00:00Z",
+           "end_at": "2026-09-20T08:00:00Z"},
+    ).status_code == 422
+    # 空时间范围（start == end）
+    assert _metrics(
+        client,
+        **{**base,
+           "start_at": "2026-09-20T08:00:00Z",
+           "end_at": "2026-09-20T08:00:00Z"},
+    ).status_code == 422
+    # 非法时间字符串
+    assert _metrics(client, **{**base, "start_at": "soon"}).status_code == 422
+    # 桶数超过上限（10001）
+    assert _metrics(
+        client,
+        **{**base,
+           "start_at": "2026-09-20T08:00:00Z",
+           "end_at": "2026-09-20T10:46:41Z",
+           "bucket_seconds": 1},
+    ).status_code == 422
+
+
+def test_metrics_bucket_count_at_limit_allowed(client):
+    # 恰好 10000 个桶允许
+    resp = _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20T08:00:00Z",
+        end_at="2026-09-27T06:40:00Z",  # 08:00 起 10000 分钟
+        bucket_seconds=60,
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["buckets"]) == 10000
+
+
+def test_metrics_is_read_only(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")
+    segs = client.get("/segments").json()
+    changes = client.get("/segment-changes").json()
+    for _ in range(3):
+        _metrics(
+            client,
+            source="gw-01",
+            start_at="2026-09-20T08:00:00Z",
+            end_at="2026-09-20T09:00:00Z",
+            bucket_seconds=60,
+        )
+    assert client.get("/segments").json() == segs
+    assert client.get("/segment-changes").json() == changes
+
+
+def test_metrics_route_does_not_conflict_with_events_routes(client):
+    # GET /events/metrics 与 GET/POST /events、DELETE /events/{source}/{event_id} 共存
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")
+    assert client.get("/events", params={"source": "gw-01"}).status_code == 200
+    assert _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20T08:00:00Z",
+        end_at="2026-09-20T08:01:00Z",
+        bucket_seconds=60,
+    ).status_code == 200
+    assert client.delete("/events/gw-01/e1").status_code == 200
+    body = _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20T08:00:00Z",
+        end_at="2026-09-20T08:01:00Z",
+        bucket_seconds=60,
+    ).json()
+    assert body["buckets"][0]["event_count"] == 0
+
+
 # ---- 人工确认审计 POST/GET /segments/{id}/acknowledgements ----
 
 def _ack(client, segment_id, *, operator="ops-alice", note="已确认",
