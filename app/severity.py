@@ -10,6 +10,11 @@ _LEVELS = {
     "critical": 50,
 }
 
+# 按权重升序的全部级别名（统计桶固定输出顺序）
+SEVERITY_NAMES: tuple[str, ...] = tuple(
+    name for name, _ in sorted(_LEVELS.items(), key=lambda kv: kv[1])
+)
+
 # 常见别名归一化
 _ALIASES = {
     "warn": "warning",

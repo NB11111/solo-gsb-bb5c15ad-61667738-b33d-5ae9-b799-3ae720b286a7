@@ -997,6 +997,167 @@ class ServiceTestCase(unittest.TestCase):
         self.assertEqual(p1, p2)
         self.assertEqual(len(p2["events"]), 1)
 
+    # ---- 事件时间桶统计 event_metrics ----
+
+    def metrics(self, source, start_ts, end_ts, bucket_seconds):
+        with read_only_session(self.db_path) as conn:
+            return service.event_metrics(
+                conn,
+                source=source,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                bucket_seconds=bucket_seconds,
+            )
+
+    def test_metrics_buckets_severity_counts_totals_and_empty_buckets(self):
+        # SILENCE=10：a/b/c 同段，d 为另一段
+        self.submit("s1", "a", 0.0, "info")
+        self.submit("s1", "b", 5.0, "error")
+        self.submit("s1", "c", 8.0, "info")
+        self.submit("s1", "d", 30.0, "critical")
+        r = self.metrics("s1", 0.0, 40.0, 10)
+        self.assertEqual(r["source"], "s1")
+        self.assertEqual(r["bucket_seconds"], 10)
+        self.assertEqual(r["start_at"], "1970-01-01T00:00:00+00:00")
+        self.assertEqual(r["end_at"], "1970-01-01T00:00:40+00:00")
+        self.assertEqual(len(r["buckets"]), 4)  # 覆盖含空桶在内的全部桶
+        b0, b1, b2, b3 = r["buckets"]
+        self.assertEqual(b0["severity_counts"], {
+            "debug": 0, "info": 2, "warning": 0, "error": 1, "critical": 0,
+        })
+        self.assertEqual(b0["total"], 3)
+        self.assertEqual(b0["distinct_segment_count"], 1)
+        self.assertEqual(b0["bucket_start"], "1970-01-01T00:00:00+00:00")
+        self.assertEqual(b0["bucket_end"], "1970-01-01T00:00:10+00:00")
+        for empty in (b1, b2):
+            self.assertEqual(empty["total"], 0)
+            self.assertEqual(empty["distinct_segment_count"], 0)
+            self.assertEqual(set(empty["severity_counts"].values()), {0})
+        self.assertEqual(b3["severity_counts"]["critical"], 1)
+        self.assertEqual(b3["total"], 1)
+        self.assertEqual(b3["distinct_segment_count"], 1)
+
+    def test_metrics_buckets_are_time_ordered_and_fixed_width(self):
+        for i in range(4):
+            self.submit("s1", f"e{i}", float(i * 10))
+        r = self.metrics("s1", 0.0, 40.0, 10)
+        starts = [b["bucket_start"] for b in r["buckets"]]
+        self.assertEqual(starts, [
+            "1970-01-01T00:00:00+00:00",
+            "1970-01-01T00:00:10+00:00",
+            "1970-01-01T00:00:20+00:00",
+            "1970-01-01T00:00:30+00:00",
+        ])
+        for i, b in enumerate(r["buckets"]):
+            self.assertEqual(b["total"], 1)
+
+    def test_metrics_left_closed_right_open_window_and_buckets(self):
+        # 事件恰好在桶沿/窗口沿：start 计入，end 不计入；桶沿归入左闭的新桶
+        self.submit("s1", "at_start", 0.0)
+        self.submit("s1", "at_edge", 10.0)
+        self.submit("s1", "at_end", 20.0)
+        r = self.metrics("s1", 0.0, 20.0, 10)
+        self.assertEqual(len(r["buckets"]), 2)
+        self.assertEqual(r["buckets"][0]["total"], 1)   # 0.0 计入，10.0 不在此桶
+        self.assertEqual(r["buckets"][1]["total"], 1)   # 10.0 计入
+        self.assertEqual(sum(b["total"] for b in r["buckets"]), 2)  # 20.0 不计
+
+    def test_metrics_last_bucket_clipped_to_end(self):
+        # 跨度 25s、桶长 10s → 3 桶，末桶仅 5s
+        self.submit("s1", "a", 0.0)
+        self.submit("s1", "b", 21.0)
+        r = self.metrics("s1", 0.0, 25.0, 10)
+        self.assertEqual(len(r["buckets"]), 3)
+        last = r["buckets"][-1]
+        self.assertEqual(last["bucket_start"], "1970-01-01T00:00:20+00:00")
+        self.assertEqual(last["bucket_end"], "1970-01-01T00:00:25+00:00")
+        self.assertEqual(last["total"], 1)
+        # 恰好落在 end 上的事件不被末桶计入
+        self.submit("s1", "c", 25.0)
+        r = self.metrics("s1", 0.0, 25.0, 10)
+        self.assertEqual(r["buckets"][-1]["total"], 1)
+
+    def test_metrics_distinct_segment_count_dedupes_within_bucket(self):
+        # 同桶多个事件但同一段（SILENCE=10）→ distinct 为 1
+        self.submit("s1", "a", 0.0)
+        self.submit("s1", "b", 5.0)
+        r = self.metrics("s1", 0.0, 10.0, 10)
+        self.assertEqual(r["buckets"][0]["total"], 2)
+        self.assertEqual(r["buckets"][0]["distinct_segment_count"], 1)
+        # 同桶内相距超过静默间隔的不同段 → distinct 为 2
+        self.submit("s1", "c", 30.0)
+        self.submit("s1", "d", 35.0)
+        r = self.metrics("s1", 0.0, 40.0, 100)
+        self.assertEqual(r["buckets"][0]["total"], 4)
+        self.assertEqual(r["buckets"][0]["distinct_segment_count"], 2)
+
+    def test_metrics_distinct_segment_reflects_current_assignment(self):
+        self.submit("s1", "e1", 0.0)
+        self.submit("s1", "e2", 20.0)  # 间隔 20 > SILENCE(10) → 两个不同段
+        r = self.metrics("s1", 0.0, 100.0, 100)
+        self.assertEqual(r["buckets"][0]["distinct_segment_count"], 2)
+        self.submit("s1", "e3", 10.0)  # 与两侧都恰好相距 10 → 桥接合并
+        r = self.metrics("s1", 0.0, 100.0, 100)
+        self.assertEqual(r["buckets"][0]["total"], 3)
+        self.assertEqual(r["buckets"][0]["distinct_segment_count"], 1)
+        self.withdraw("s1", "e3")  # 撤回桥接事件 → 重新拆为两段
+        r = self.metrics("s1", 0.0, 100.0, 100)
+        self.assertEqual(r["buckets"][0]["total"], 2)
+        self.assertEqual(r["buckets"][0]["distinct_segment_count"], 2)
+
+    def test_metrics_source_isolation_and_unknown_source(self):
+        self.submit("s1", "a", 0.0)
+        self.submit("s2", "b", 0.0, "error")
+        r = self.metrics("s1", 0.0, 10.0, 10)
+        self.assertEqual(r["buckets"][0]["total"], 1)
+        self.assertEqual(r["buckets"][0]["severity_counts"]["info"], 1)
+        r = self.metrics("ghost", 0.0, 10.0, 10)
+        self.assertEqual(len(r["buckets"]), 1)
+        self.assertEqual(r["buckets"][0]["total"], 0)
+
+    def test_metrics_empty_range_still_covers_buckets(self):
+        # 无任何事件时也覆盖时间范围内的全部桶
+        r = self.metrics("s1", 0.0, 30.0, 10)
+        self.assertEqual(len(r["buckets"]), 3)
+        self.assertTrue(all(b["total"] == 0 for b in r["buckets"]))
+
+    def test_metrics_invalid_range_raises_value_error(self):
+        for start_ts, end_ts in [(10.0, 10.0), (20.0, 10.0)]:
+            with self.assertRaises(ValueError):
+                self.metrics("s1", start_ts, end_ts, 10)
+
+    def test_metrics_too_many_buckets_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            self.metrics("s1", 0.0, 10_001.0, 1)
+
+    def test_metrics_fractional_seconds_boundary_placement(self):
+        # 微秒级事件落在桶沿附近时按 occurred_at 可靠归桶
+        self.submit("s1", "a", 9.999999, "info")
+        self.submit("s1", "b", 10.0, "error")
+        self.submit("s1", "c", 10.000001, "warning")
+        r = self.metrics("s1", 0.0, 20.0, 10)
+        self.assertEqual(r["buckets"][0]["total"], 1)
+        self.assertEqual(r["buckets"][1]["total"], 2)
+
+    def test_metrics_does_not_mutate_data_and_uses_snapshot(self):
+        self.submit("s1", "e1", 0.0)
+        with read_only_session(self.db_path) as conn:
+            m1 = service.event_metrics(
+                conn, source="s1", start_ts=0.0, end_ts=100.0, bucket_seconds=10
+            )
+            self.submit("s1", "e2", 50.0)  # 快照开启后的写入对本快照不可见
+            after_write = self.changes()
+            m2 = service.event_metrics(
+                conn, source="s1", start_ts=0.0, end_ts=100.0, bucket_seconds=10
+            )
+        self.assertEqual(m1, m2)
+        self.assertEqual(sum(b["total"] for b in m2["buckets"]), 1)
+        # 统计本身纯读：快照内的两次 metrics 之后变更流仍只反映 e2 的写入
+        self.assertEqual(self.changes(), after_write)
+        # 快照开启后写入的 e2 在新快照中可见
+        r = self.metrics("s1", 0.0, 100.0, 10)
+        self.assertEqual(sum(b["total"] for b in r["buckets"]), 2)
+
     # ---- 人工确认审计（acknowledge_segment / list_acknowledgements）----
 
     def ack(self, segment_id, *, operator="ops", note="n",

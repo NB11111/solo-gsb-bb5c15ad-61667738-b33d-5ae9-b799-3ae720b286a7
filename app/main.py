@@ -14,6 +14,7 @@ from .schemas import (
     AcknowledgementIn,
     AcknowledgementOut,
     EventIn,
+    EventMetricsResponse,
     EventsPage,
     IngestResponse,
     ResegmentationPreviewResponse,
@@ -94,6 +95,46 @@ def create_app(settings: Settings) -> FastAPI:
                     limit=limit,
                 )
         except ValueError as exc:  # 游标解码失败等输入错误 → 422
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/events/metrics", response_model=EventMetricsResponse)
+    def event_metrics(
+        source: str = Query(min_length=1, max_length=256),
+        start_at: datetime = Query(...),
+        end_at: datetime = Query(...),
+        bucket_seconds: int = Query(..., ge=1),
+    ) -> dict:
+        """事件审计时间桶统计：在**单一只读快照**（query_only 连接）内聚合。
+
+        - ``source`` 必填；``start_at`` / ``end_at`` 必填（ISO 8601，无时区按
+          UTC 处理），事件窗口与时间桶均为**左闭右开**——``occurred_at`` 恰好
+          等于 ``start_at`` 计入、恰好等于 ``end_at`` 不计入；
+        - 时间桶自 ``start_at`` 起每 ``bucket_seconds``（≥1 的整数秒）一个，
+          边界统一按 UTC 对齐；末桶右端截断为 ``end_at``（可能不足一个桶长）；
+        - 每桶返回各 severity 计数、总数与涉及的不同 segment_id 数
+          （segment_id 为查询时刻归属），**覆盖无事件空桶**，按时间升序输出；
+        - 非法时间范围（``start_at >= end_at``）、非正/非整数桶长或桶数过多
+          （超过 10000 桶）返回 422；接口纯读，不改写任何表。
+        """
+        if start_at.tzinfo is None:
+            start_at = start_at.replace(tzinfo=timezone.utc)
+        if end_at.tzinfo is None:
+            end_at = end_at.replace(tzinfo=timezone.utc)
+        if start_at >= end_at:
+            raise HTTPException(
+                status_code=422, detail="start_at 必须早于 end_at（左闭右开时间范围）"
+            )
+
+        try:
+            with read_only_session(settings.database_path) as conn:
+                return service.event_metrics(
+                    conn,
+                    source=source,
+                    start_ts=start_at.timestamp(),
+                    end_ts=end_at.timestamp(),
+                    bucket_seconds=bucket_seconds,
+                )
+        except ValueError as exc:  # 桶数超过上限等输入错误 → 422
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/events", response_model=IngestResponse)

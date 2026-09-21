@@ -68,6 +68,43 @@ class EventsPage(BaseModel):
     next_after: str | None = None
 
 
+class SeverityCounts(BaseModel):
+    """一个时间桶内各 severity 的事件数；未出现的级别计数为 0。"""
+
+    debug: int = 0
+    info: int = 0
+    warning: int = 0
+    error: int = 0
+    critical: int = 0
+
+
+class MetricsBucket(BaseModel):
+    """一个左闭右开时间桶 [bucket_start, bucket_end) 的统计。
+
+    - severity_counts：各 severity 计数，total 为其总和（空桶全为 0）；
+    - distinct_segment_count：桶内事件涉及的不同 segment_id 数（查询时刻归属）；
+    - 末桶可能不足 bucket_seconds：其 end 截断为查询上界 end_at。
+    """
+
+    bucket_start: datetime
+    bucket_end: datetime
+    severity_counts: SeverityCounts
+    total: int
+    distinct_segment_count: int
+
+
+class EventMetricsResponse(BaseModel):
+    """事件时间桶统计响应：覆盖 [start_at, end_at) 内全部时间桶（含空桶），
+    按 bucket_start 升序；全部统计在同一只读快照事务内完成，纯读。
+    """
+
+    source: str
+    start_at: datetime
+    end_at: datetime
+    bucket_seconds: int
+    buckets: list[MetricsBucket]
+
+
 class WithdrawResponse(BaseModel):
     """误报事件撤回结果。
 

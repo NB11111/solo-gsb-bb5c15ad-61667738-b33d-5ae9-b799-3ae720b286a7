@@ -1,6 +1,6 @@
 # 设备告警事件段聚合服务
 
-基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。误报事件可通过 `DELETE /events/{source}/{event_id}` 撤回，服务在单事务内删除事件并按静默间隔重算其原段（删除/收缩/拆分）。`GET /events` 提供事件审计查询：在单一只读快照内按 `(occurred_at, event_id)` 稳定排序、支持时间窗与 severity 多值过滤及游标分页。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步，并通过 `GET /segments/snapshot` 按**变更水位**重建任一历史时刻的段状态快照。运维人员可通过 `POST /segments/{id}/acknowledgements` 对事件段做**人工确认**：在事务内校验段的当前 revision 后追加**不可变**的确认审计记录（幂等键防重），并通过 `GET /segments/{id}/acknowledgements` 按确认序号升序查询。
+基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。误报事件可通过 `DELETE /events/{source}/{event_id}` 撤回，服务在单事务内删除事件并按静默间隔重算其原段（删除/收缩/拆分）。`GET /events` 提供事件审计查询：在单一只读快照内按 `(occurred_at, event_id)` 稳定排序、支持时间窗与 severity 多值过滤及游标分页；`GET /events/metrics` 则在同一只读快照内按 `occurred_at` 将事件划入**左闭右开时间桶**，返回每桶各 severity 计数、总数与涉及的不同 segment_id 数（覆盖空桶）。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步，并通过 `GET /segments/snapshot` 按**变更水位**重建任一历史时刻的段状态快照。运维人员可通过 `POST /segments/{id}/acknowledgements` 对事件段做**人工确认**：在事务内校验段的当前 revision 后追加**不可变**的确认审计记录（幂等键防重），并通过 `GET /segments/{id}/acknowledgements` 按确认序号升序查询。
 
 ## 快速开始
 
@@ -107,6 +107,62 @@ curl 'http://localhost:8000/events?source=edge-gateway-01&start_at=2026-09-20T00
 - **空页游标保持不变**：到达末尾时返回 `{"events": [], "next_after": "<同一个 after>"}`，可直接用该游标继续轮询；首次请求（不带 `after`）且无数据时 `next_after` 为 `null`。
 - **快照一致性**：全部过滤与分页读取在同一只读事务快照内完成，请求期间的并发写入不影响本次结果；接口纯读，不会改写事件、段或变更流。
 - 参数校验失败（缺 `source`、`limit` 越界、非法 `severity`/时间、`start_at > end_at`、伪造游标）统一返回 `422`。
+
+### 事件时间桶统计 `GET /events/metrics`
+
+在**单一只读快照事务**（`query_only` 连接）内，把指定来源、`[start_at, end_at)` 时间窗内的事件按 `occurred_at` 划入**等长左闭右开时间桶**（`[bucket_start, bucket_end)`），逐桶返回各 severity 计数、事件总数与涉及的不同 `segment_id` 数。**无事件的空桶同样返回**，桶按时间升序输出；接口纯读，不改写任何表。
+
+```bash
+curl 'http://localhost:8000/events/metrics?source=edge-gateway-01&start_at=2026-09-20T08:00:00Z&end_at=2026-09-20T08:04:00Z&bucket_seconds=60'
+```
+
+```json
+{
+  "source": "edge-gateway-01",
+  "start_at": "2026-09-20T08:00:00+00:00",
+  "end_at": "2026-09-20T08:04:00+00:00",
+  "bucket_seconds": 60,
+  "buckets": [
+    {
+      "bucket_start": "2026-09-20T08:00:00+00:00",
+      "bucket_end": "2026-09-20T08:01:00+00:00",
+      "severity_counts": {
+        "debug": 0,
+        "info": 1,
+        "warning": 0,
+        "error": 1,
+        "critical": 0
+      },
+      "total": 2,
+      "distinct_segment_count": 1
+    },
+    {
+      "bucket_start": "2026-09-20T08:01:00+00:00",
+      "bucket_end": "2026-09-20T08:02:00+00:00",
+      "severity_counts": { "debug": 0, "info": 0, "warning": 0, "error": 0, "critical": 0 },
+      "total": 0,
+      "distinct_segment_count": 0
+    }
+  ]
+}
+```
+
+查询参数：
+
+| 参数 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `source` | 是 | — | 只统计该来源的事件（1–256 字符） |
+| `start_at` | 是 | — | 时间窗下界与首个桶沿（**含边界**），ISO 8601；无时区按 UTC 处理；必须早于 `end_at` |
+| `end_at` | 是 | — | 时间窗上界（**不含边界**），ISO 8601；无时区按 UTC 处理；`occurred_at` 恰好等于该值的事件不计入 |
+| `bucket_seconds` | 是 | — | 桶长（**正整数秒**，≥ 1）；桶沿自 `start_at` 起每该秒数一个 |
+
+- **左闭右开**：事件窗口与时间桶均为 `[start, end)`——事件恰好在桶沿（如 `08:01:00`）归入该时刻开始的新桶；恰好在 `start_at` 的事件计入、恰好在 `end_at` 的事件不计入。
+- **桶边界统一按 UTC**：所有时间先归一化为 UTC 再分桶（带时区偏移的入参按其对应的 UTC 时刻处理），桶内时间比较以纪元微秒整数进行，规避浮点误差导致的边界错桶。
+- **末桶截断**：时间跨度不是桶长整数倍时，末桶右端截断为 `end_at`（可能不足一个桶长），桶数为 `ceil((end_at - start_at) / bucket_seconds)`。
+- **空桶覆盖**：时间范围内的每个桶都会输出（即使无事件），空桶各级别计数、`total` 与 `distinct_segment_count` 均为 0；未知 source 同样返回完整的零值桶序列。
+- **`distinct_segment_count`**：桶内事件当前 `segment_id`（查询时刻归属，撤回/合并重算后会变化）的去重计数。
+- **上限**：单次最多输出 **10000** 桶；桶数过多（桶长相对跨度过小）返回 `422`，请增大 `bucket_seconds` 或缩短时间范围。
+- 参数校验失败（缺参数、空 `source`、非法时间、`start_at >= end_at`、桶长非正/非整数、桶数超过 10000）统一返回 `422`。
 
 ### 查询事件段详情 `GET /segments/{id}`
 
@@ -354,7 +410,7 @@ python3 -m unittest tests.test_service -v
 ```
 app/
   main.py      # FastAPI 路由与生命周期（启动时幂等建表）
-  service.py   # 归段/合并/去重/撤回核心逻辑、事件审计查询与变更水位快照
+  service.py   # 归段/合并/去重/撤回核心逻辑、事件审计查询、时间桶统计与变更水位快照
   schemas.py   # 请求/响应模型与校验
   severity.py  # 告警级别定义与排序
   db.py        # SQLite 连接、schema、事务

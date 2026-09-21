@@ -34,6 +34,14 @@
 - 键集分页游标 after/next_after 为不透明字符串，编码上一页末行的
   (occurred_at, event_id) 复合位置；空页回显入参 after，游标保持不变。
 
+事件时间桶统计（event_metrics，纯读）：
+- 在调用方提供的同一只读快照内，把 [start_ts, end_ts) 左闭右开窗口内、
+  指定 source 的事件按 occurred_at 划入自 start_ts 对齐的等长左闭右开时间桶；
+- 每桶输出各 severity 计数、总数与涉及的不同 segment_id（查询时刻归属）数；
+- 覆盖窗口内全部桶（含空桶）、按桶起点升序，末桶右端截断为 end_ts；
+- 时间统一按 UTC 纪元微秒整数做整除分桶，规避浮点误差导致的边界错桶；
+- 桶数超过 MAX_METRICS_BUCKETS 抛 ValueError（调用方回 422），仅执行 SELECT。
+
 变更水位历史快照（get_segment_snapshot，纯读）：
 - 在调用方提供的同一只读事务内，以 segment_changes 为唯一事实来源重建
   指定变更水位（at_change_id）时刻的段状态：每个 segment_id 取不晚于水位的
@@ -192,6 +200,93 @@ def list_events(
         else after
     )
     return {"events": events, "next_after": next_after}
+
+
+# 统计接口单次允许输出的最大桶数：防止桶长相对时间跨度过小导致无界内存占用
+MAX_METRICS_BUCKETS = 10_000
+
+
+def event_metrics(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    start_ts: float,
+    end_ts: float,
+    bucket_seconds: int,
+) -> dict:
+    """按固定长度时间桶统计事件（纯读）：各 severity 计数、总数与不同 segment_id 数。
+
+    - 事件窗口为左闭右开 [start_ts, end_ts)（epoch 秒），occurred_at 恰好等于
+      end_ts 的事件不计入；时间桶同样左闭右开，桶沿自 start_ts 起每
+      bucket_seconds 一个，末桶右端截断为 end_ts（可能不足一个桶长）；
+    - 覆盖时间范围内的**全部**时间桶（含无事件空桶），按 bucket_start 升序；
+    - distinct_segment_count 按事件当前 segment_id（查询时刻归属）去重；
+    - 桶数（ceil(跨度/桶长)）超过 MAX_METRICS_BUCKETS 抛 ValueError（调用方回 422）；
+    - 返回 {"source", "start_at", "end_at", "bucket_seconds", "buckets": [...]}，
+      其中 start_at/end_at 与桶边界均为 UTC ISO 8601 字符串。
+
+    时间比较统一换算为 UTC 纪元微秒整数后做整除分桶，规避浮点表示误差：
+    事件 occurred_at 经四舍五入到微秒（双精度在当前年代的精度远高于此），
+    恰好落在桶沿的事件可靠归入左闭的新桶而非上一桶。
+
+    调用方应使用 read_only_session：本函数只执行 SELECT，结果取自同一只读快照。
+    """
+    if start_ts >= end_ts:
+        raise ValueError("start_ts 必须早于 end_ts（左闭右开时间范围）")
+    start_us = round(start_ts * 1_000_000)
+    end_us = round(end_ts * 1_000_000)
+    bucket_us = bucket_seconds * 1_000_000
+    span_us = end_us - start_us
+    bucket_count = (span_us + bucket_us - 1) // bucket_us  # ceil，span_us > 0
+    if bucket_count > MAX_METRICS_BUCKETS:
+        raise ValueError(
+            f"桶数 {bucket_count} 超过上限 {MAX_METRICS_BUCKETS}：请增大 bucket_seconds"
+            " 或缩短时间范围"
+        )
+
+    rows = conn.execute(
+        """
+        SELECT occurred_at, severity, segment_id
+        FROM events
+        WHERE source = ? AND occurred_at >= ? AND occurred_at < ?
+        """,
+        (source, start_ts, end_ts),
+    ).fetchall()
+
+    # 每桶：各 severity 计数 + segment_id 去重集合；空桶以零值预填
+    counts: list[dict[str, int]] = [
+        {name: 0 for name in sev.SEVERITY_NAMES} for _ in range(bucket_count)
+    ]
+    distinct_segments: list[set[int]] = [set() for _ in range(bucket_count)]
+    for row in rows:
+        ts_us = round(row["occurred_at"] * 1_000_000)
+        index = (ts_us - start_us) // bucket_us
+        # SQL 已按 [start, end) 过滤；夹取以防取整带来的越界
+        index = min(max(index, 0), bucket_count - 1)
+        counts[index][row["severity"]] += 1
+        distinct_segments[index].add(row["segment_id"])
+
+    buckets = []
+    for index in range(bucket_count):
+        bucket_start_us = start_us + index * bucket_us
+        bucket_end_us = min(bucket_start_us + bucket_us, end_us)
+        severity_counts = counts[index]
+        buckets.append(
+            {
+                "bucket_start": _iso(bucket_start_us / 1_000_000),
+                "bucket_end": _iso(bucket_end_us / 1_000_000),
+                "severity_counts": severity_counts,
+                "total": sum(severity_counts.values()),
+                "distinct_segment_count": len(distinct_segments[index]),
+            }
+        )
+    return {
+        "source": source,
+        "start_at": _iso(start_ts),
+        "end_at": _iso(end_ts),
+        "bucket_seconds": bucket_seconds,
+        "buckets": buckets,
+    }
 
 
 def _record_change(
